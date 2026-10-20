@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -92,11 +93,21 @@ public:
     const double report_period_s = declare_parameter("report_period_s", 1.0);
     const bool reliable = declare_parameter("reliable", false);
     const int depth = declare_parameter("depth", 10);
+    const std::string csv_path = declare_parameter("csv_path", std::string());
 
     if (rate_hz <= 0.0 || payload_size_ < 0 || report_period_s <= 0.0) {
       throw std::invalid_argument("rate_hz and report_period_s must be > 0, payload_size >= 0");
     }
     timeout_ns_ = static_cast<int64_t>(timeout_s * 1e9);
+
+    // One row per message outcome, for offline analysis (see tools/mesh_test.py).
+    if (!csv_path.empty()) {
+      csv_ = std::fopen(csv_path.c_str(), "w");
+      if (!csv_) {
+        throw std::runtime_error("cannot open csv_path: " + csv_path);
+      }
+      std::fprintf(csv_, "seq,send_ns,rtt_ms,status\n");
+    }
 
     // QoS must match pong_node's, otherwise the two sides never connect.
     rclcpp::QoS qos(static_cast<size_t>(depth));
@@ -110,6 +121,10 @@ public:
     sub_ = create_subscription<Ping>(
       "pong", qos, [this](Ping::ConstSharedPtr msg) {on_pong(*msg);});
 
+    // Messages sent before DDS discovery completes are silently dropped, which
+    // would show up as loss. Poll for the match quickly (independent of rate_hz)
+    // so the discovery time is measured to ~5 ms, and only send once matched.
+    match_timer_ = create_wall_timer(std::chrono::milliseconds(5), [this] {check_matched();});
     send_timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / rate_hz), [this] {send();});
     report_timer_ = create_wall_timer(
@@ -122,6 +137,13 @@ public:
       rate_hz, static_cast<long>(payload_size_), static_cast<long>(count_), timeout_s);
   }
 
+  ~PingNode() override
+  {
+    if (csv_) {
+      std::fclose(csv_);
+    }
+  }
+
   void print_summary()
   {
     expire_outstanding();
@@ -131,8 +153,25 @@ public:
   }
 
 private:
+  void check_matched()
+  {
+    if (pub_->get_subscription_count() == 0 || sub_->get_publisher_count() == 0) {
+      return;
+    }
+    matched_ = true;
+    match_timer_->cancel();
+    // Parsed by tools/mesh_test.py as the discovery time.
+    RCLCPP_INFO(
+      get_logger(), "pong matched after %.0f ms, sending",
+      static_cast<double>(now_ns() - start_ns_) / 1e6);
+  }
+
   void send()
   {
+    if (!matched_) {
+      return;
+    }
+
     if (count_ > 0 && next_seq_ >= static_cast<uint64_t>(count_)) {
       send_timer_->cancel();
       done_sending_ = true;
@@ -155,9 +194,11 @@ private:
     const int64_t now = now_ns();
 
     auto it = outstanding_.find(msg.seq);
+    const double rtt_ms = static_cast<double>(now - msg.send_time_ns) / 1e6;
     if (it == outstanding_.end()) {
       window_.late++;
       total_.late++;
+      write_row(msg.seq, msg.send_time_ns, "late", rtt_ms);
       return;
     }
     outstanding_.erase(it);
@@ -165,12 +206,13 @@ private:
     if (have_highest_seq_ && msg.seq < highest_seq_) {
       window_.reordered++;
       total_.reordered++;
+      write_row(msg.seq, msg.send_time_ns, "reordered", rtt_ms);
     } else {
       highest_seq_ = msg.seq;
       have_highest_seq_ = true;
+      write_row(msg.seq, msg.send_time_ns, "ok", rtt_ms);
     }
 
-    const double rtt_ms = static_cast<double>(now - msg.send_time_ns) / 1e6;
     for (Stats * s : {&window_, &total_}) {
       s->received++;
       s->rtts_ms.push_back(rtt_ms);
@@ -189,14 +231,36 @@ private:
   {
     const int64_t cutoff = now_ns() - timeout_ns_;
     while (!outstanding_.empty() && outstanding_.begin()->second < cutoff) {
+      write_row(outstanding_.begin()->first, outstanding_.begin()->second, "lost");
       outstanding_.erase(outstanding_.begin());
       window_.lost++;
       total_.lost++;
     }
   }
 
+  void write_row(
+    uint64_t seq, int64_t send_ns, const char * status,
+    double rtt_ms = std::numeric_limits<double>::quiet_NaN())
+  {
+    if (!csv_) {
+      return;
+    }
+    if (std::isnan(rtt_ms)) {
+      std::fprintf(
+        csv_, "%lu,%ld,,%s\n", static_cast<unsigned long>(seq), static_cast<long>(send_ns), status);
+    } else {
+      std::fprintf(
+        csv_, "%lu,%ld,%.3f,%s\n", static_cast<unsigned long>(seq), static_cast<long>(send_ns),
+        rtt_ms, status);
+    }
+  }
+
   void report()
   {
+    if (!matched_) {
+      RCLCPP_INFO(get_logger(), "waiting for pong_node...");
+      return;
+    }
     expire_outstanding();
     RCLCPP_INFO(get_logger(), "%s", format_stats(window_).c_str());
     window_.clear();
@@ -210,6 +274,10 @@ private:
   int64_t count_;
   int64_t timeout_ns_;
 
+  std::FILE * csv_ = nullptr;
+  const int64_t start_ns_ = now_ns();
+
+  bool matched_ = false;
   uint64_t next_seq_ = 0;
   bool done_sending_ = false;
   std::map<uint64_t, int64_t> outstanding_;  // seq -> send_time_ns
@@ -224,6 +292,7 @@ private:
 
   rclcpp::Publisher<Ping>::SharedPtr pub_;
   rclcpp::Subscription<Ping>::SharedPtr sub_;
+  rclcpp::TimerBase::SharedPtr match_timer_;
   rclcpp::TimerBase::SharedPtr send_timer_;
   rclcpp::TimerBase::SharedPtr report_timer_;
 };

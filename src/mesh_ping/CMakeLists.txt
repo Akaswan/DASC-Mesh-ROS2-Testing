@@ -25,7 +25,11 @@ add_executable(pong_node src/pong_node.cpp)
 ament_target_dependencies(pong_node rclcpp)
 rosidl_target_interfaces(pong_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-install(TARGETS ping_node pong_node
+add_executable(load_node src/load_node.cpp)
+ament_target_dependencies(load_node rclcpp)
+rosidl_target_interfaces(load_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
+install(TARGETS ping_node pong_node load_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

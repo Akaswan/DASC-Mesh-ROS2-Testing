@@ -12,10 +12,12 @@ Target: ROS 2 Foxy (Ubuntu 20.04), default RMW (Fast DDS). Foxy is EOL, so the c
 
 ## Build
 
-### Docker (either machine)
+Either way works on either machine; both ends just need to run Foxy.
 
-The `ros:foxy-ros-base` image is multi-arch, so this works on the x86 laptop and a
-64-bit OS on the Pi:
+### Docker
+
+The `ros:foxy-ros-base` image is multi-arch (amd64 + arm64), so the same build works
+on the x86 laptop and a 64-bit Pi:
 
 ```bash
 docker build -t mesh-ping .
@@ -27,7 +29,12 @@ Always run with host networking so DDS sees the real mesh interface:
 docker run --rm -it --network host --ipc host -e ROS_DOMAIN_ID=42 mesh-ping <command>
 ```
 
-### Native (Ubuntu 20.04 with Foxy installed, e.g. the Pi)
+e.g. `<command>` = `ros2 run mesh_ping pong_node`.
+
+### Native (Ubuntu 20.04)
+
+Install `ros-foxy-ros-base`, `ros-foxy-demo-nodes-cpp` and
+`python3-colcon-common-extensions`, then from the repo root:
 
 ```bash
 source /opt/ros/foxy/setup.bash
@@ -41,7 +48,7 @@ Run these in order between the two machines; each one depends on the previous.
 
 1. `ping <other-ip>`, which checks L2/L3 across the mesh
 2. `ros2 multicast receive` on one, `ros2 multicast send` on the other, which checks that DDS discovery traffic crosses the mesh
-3. `ros2 run demo_nodes_cpp talker` / `listener` (needs the `ros:foxy` image or `ros-foxy-demo-nodes-cpp`)
+3. `ros2 run demo_nodes_cpp talker` / `listener` (needs `ros-foxy-demo-nodes-cpp`)
 
 Both machines must use the same `ROS_DOMAIN_ID` and must not set `ROS_LOCALHOST_ONLY=1`.
 Allow UDP from the mesh subnet through any firewall.
@@ -74,6 +81,7 @@ automatically once `count` messages are sent and resolved).
 | ping | `count` | `0` | Messages to send; `0` = until Ctrl-C |
 | ping | `timeout_s` | `2.0` | No echo within this long → counted lost |
 | ping | `report_period_s` | `1.0` | Interval between report lines |
+| ping | `csv_path` | `""` | If set, write one row per message outcome here (used by `tools/mesh_test.py`) |
 | pong | `echo_payload` | `true` | `false` = strip payload on the reply, loading only the ping→pong direction |
 
 ### Output fields
@@ -82,3 +90,18 @@ automatically once `count` messages are sent and resolved).
 - `late` means an echo arrived after it was already counted lost, or a duplicate. Late messages are also counted in `lost`.
 - `reord` means an echo arrived after one with a higher sequence number.
 - `jitter` is the mean absolute difference between consecutive RTTs.
+
+`ping_node` doesn't start sending until it has discovered `pong_node` in both directions,
+so DDS discovery time isn't counted as loss. It logs how long discovery took.
+
+## Field tests
+
+[docs/TESTING.md](docs/TESTING.md) is the full guide: distance falloff, obstacles,
+throughput, hop count, QoS comparison, walk, failover, direction asymmetry, discovery and
+background load, and soak tests. It covers the physical setup, exact commands, the CSV
+formats and how to read the plots. The short version:
+
+```bash
+python3 tools/mesh_test.py run  --campaign hallway --distance 5 --payload 64,1024 --repeat 2
+python3 tools/mesh_test.py plot --campaign hallway        # needs matplotlib
+```
